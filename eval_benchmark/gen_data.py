@@ -144,7 +144,7 @@ def main():
     used_prompts = []
     gathered_data = []
     for i, output in enumerate(outputs):
-        tmp_data = {"prompt": ds[i]["prompt"], "gt": ds[i]["gt"], "responses": [out.text for out in output.outputs]}
+        tmp_data = {"prompt": ds[i]["prompt"], "solution": ds[i]["solution"], "gt": ds[i]["answer"], "responses": [out.text for out in output.outputs]}
         gathered_data.append(tmp_data)
 
 
