@@ -1,7 +1,9 @@
 #export CUDA_VISIBLE_DEVICES="1,7,8,9" # GPU的ID，数量应与 NGPUS 匹配
-project_name='DAPO'
-experiment_name='GRPO-baseline-n8-bz512-256' # 更新了实验名称以作区分
-export NCCL_P2P_DISABLE=1
+export WANDB_API_KEY="a17294c76f5787d04c92fd978d0f1a29133756e2"
+export WANDB_ENTITY="weixiongml-uiuc"
+project_name='Reinforceflow'
+
+experiment_name='GRPO-Qwen2.5-1.5b-MATH-n4' # 更新了实验名称以作区分
 
 set -x
 
@@ -11,13 +13,19 @@ data=numina_math
 algorithm=grpo
 model=Qwen2.5-Math-1.5B
 model_name_or_path=Qwen/$model
-n=8
-GPUS=(2 3 4 5 6 7 8 9)
+n=4
+kl_coef=0.0
+use_kl_in_reward=False
+use_kl_loss=False
+kl_loss_coef=0.0
+clip_ratio_low=0.2
+clip_ratio_high=0.28
+GPUS=(0 1 2 3 4 5 6 7)
 my_world_size=${#GPUS[@]}
 
-math_train_path=/home/wx13/reinforceflow/verl/examples/data_preprocess/data/openr1/train.parquet
+math_train_path=/home/chenluy/reinforce_flow/reinforce_flow/data/openr1/train_hard.parquet
 
-math_test_path=/home/wx13/data/gsm8k_new/test.parquet
+math_test_path=/home/chenluy/reinforce_flow/reinforce_flow/data/test/test.parquet
 #./data/math500/test.parquet 
 
 train_files="['$math_train_path']"
@@ -34,11 +42,17 @@ CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPUS[*]}") python3 -m verl.trainer.main_pp
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    algorithm.use_kl_in_reward=${use_kl_in_reward} \
+    algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.model.path=$model_name_or_path \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -60,7 +74,7 @@ CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPUS[*]}") python3 -m verl.trainer.main_pp
     trainer.n_gpus_per_node=$my_world_size \
     trainer.val_before_train=True \
     trainer.nnodes=1 \
-    trainer.save_freq=40 \
-    trainer.default_local_dir=checkpoints/${project_name}/${experiment_name} \
-    trainer.test_freq=50000 \
-    trainer.total_epochs=4 2>&1 | tee logs/${project_name}/${experiment_name}.log
+    trainer.save_freq=50 \
+    trainer.default_local_dir=/opt/dlami/nvme/chenluy_ckpoints/${project_name}/${experiment_name} \
+    trainer.test_freq=50 \
+    trainer.total_epochs=1000 2>&1 | tee logs/${project_name}/${experiment_name}.log
