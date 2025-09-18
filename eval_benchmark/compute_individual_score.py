@@ -57,7 +57,7 @@ script_args = parser.parse_args_into_dataclasses()[0]
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
 gathered_data = []
-for i in tqdm(range(len(ds[:10])), total=len(ds[:10])):
+for i in tqdm(range(len(ds)), total=len(ds)):
     tmp_scores = []
     all_responses = ds[i]["responses"]
     ground_truth = ds[i]["gt"]
@@ -66,7 +66,7 @@ for i in tqdm(range(len(ds[:10])), total=len(ds[:10])):
         tmp_scores.append(score)
     gathered_data.append({
         "prompt": ds[i]["prompt"], 
-        "gt": ds[i]["gt"], 
+        "gt": ds[i]["gt"],
         "responses": all_responses, 
         "scores": tmp_scores
     })
