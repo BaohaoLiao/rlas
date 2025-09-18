@@ -3,12 +3,12 @@ from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
 import json
-import random
 from tqdm import tqdm
 from dataclasses import dataclass, field
 from typing import Optional
 from datasets import load_dataset
 from transformers import HfArgumentParser
+from concurrent.futures import ProcessPoolExecutor
 
 """
 If we use multiple VLLM processes to accelerate the generation, we need to use this script to merge them.
@@ -56,20 +56,25 @@ script_args = parser.parse_args_into_dataclasses()[0]
 
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
+def score_one(response_gt):
+    response, gt = response_gt
+    return compute_score(response, gt)
+
 gathered_data = []
 for i in tqdm(range(len(ds)), total=len(ds)):
-    tmp_scores = []
     all_responses = ds[i]["responses"]
     ground_truth = ds[i]["gt"]
-    for response in all_responses:
-        score = compute_score(response, ground_truth)
-        tmp_scores.append(score)
+
+    with ProcessPoolExecutor() as executor:
+        tmp_scores = list(executor.map(score_one, [(r, ground_truth) for r in all_responses]))
+
     gathered_data.append({
-        "prompt": ds[i]["prompt"], 
-        "gt": ds[i]["gt"],
-        "responses": all_responses, 
+        "prompt": ds[i]["prompt"],
+        "gt": ground_truth,
+        "responses": all_responses,
         "scores": tmp_scores
     })
+    
 
 with open(script_args.record_path, "w", encoding="utf8") as f:
     for i in range(len(gathered_data)):
