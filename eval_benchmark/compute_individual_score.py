@@ -54,7 +54,8 @@ import numpy as np
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 
-ds = load_dataset("json", data_files=script_args.dataset_path, split="train")[:10]
+ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
+ds = ds.select(np.arange(0, 10))
 
 def process_item(item):
     all_responses = item["responses"]
