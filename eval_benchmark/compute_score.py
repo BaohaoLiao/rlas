@@ -57,7 +57,7 @@ script_args = parser.parse_args_into_dataclasses()[0]
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
 all_scores = []
-for i in tqdm(range(len(ds)), total=len(ds)):
+for i in tqdm(range(len(ds[:10])), total=len(ds[:10])):
     tmp_scores = []
     all_responses = ds[i]["responses"]
     ground_truth = ds[i]["gt"]
