@@ -56,16 +56,22 @@ script_args = parser.parse_args_into_dataclasses()[0]
 
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
-all_scores = []
-for i in tqdm(range(len(ds)), total=len(ds)):
+gathered_data = []
+for i in tqdm(range(len(ds[:10])), total=len(ds[:10])):
     tmp_scores = []
     all_responses = ds[i]["responses"]
     ground_truth = ds[i]["gt"]
     for response in all_responses:
         score = compute_score(response, ground_truth)
         tmp_scores.append(score)
-    all_scores.append(tmp_scores)
+    gathered_data.append({
+        "prompt": ds[i]["prompt"], 
+        "gt": ds[i]["gt"], 
+        "responses": all_responses, 
+        "scores": tmp_scores
+    })
 
-with open(script_args.record_path, "w") as f:
-    rounded_scores = np.round(np.mean(all_scores), 4)
-    f.write(script_args.dataset_path + " " + str(rounded_scores) + "\n")
+with open(script_args.record_path, "w", encoding="utf8") as f:
+    for i in range(len(gathered_data)):
+        json.dump(gathered_data[i], f, ensure_ascii=False)
+        f.write('\n')
