@@ -54,27 +54,21 @@ import numpy as np
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 
-ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
+ds = load_dataset("json", data_files=script_args.dataset_path, split="train")[:10]
 
-def score_one(response_gt):
-    response, gt = response_gt
-    return compute_score(response, gt)
-
-gathered_data = []
-for i in tqdm(range(len(ds)), total=len(ds)):
-    all_responses = ds[i]["responses"]
-    ground_truth = ds[i]["gt"]
-
-    with ProcessPoolExecutor() as executor:
-        tmp_scores = list(executor.map(score_one, [(r, ground_truth) for r in all_responses]))
-
-    gathered_data.append({
-        "prompt": ds[i]["prompt"],
+def process_item(item):
+    all_responses = item["responses"]
+    ground_truth = item["gt"]
+    tmp_scores = [compute_score(r, ground_truth) for r in all_responses]
+    return {
+        "prompt": item["prompt"],
         "gt": ground_truth,
         "responses": all_responses,
         "scores": tmp_scores
-    })
-    
+    }
+
+with ProcessPoolExecutor() as executor:
+    gathered_data = list(tqdm(executor.map(process_item, ds), total=len(ds)))
 
 with open(script_args.record_path, "w", encoding="utf8") as f:
     for i in range(len(gathered_data)):
