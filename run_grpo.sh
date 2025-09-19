@@ -1,3 +1,7 @@
+#!/bin/bash
+
+cd /data/chatgpt-training-slc-a100/data/baliao/dynamic_filter/00_start/rlas
+
 #export CUDA_VISIBLE_DEVICES="1,7,8,9" # GPU的ID，数量应与 NGPUS 匹配
 export WANDB_MODE="offline"
 #export WANDB_API_KEY="a17294c76f5787d04c92fd978d0f1a29133756e2"
