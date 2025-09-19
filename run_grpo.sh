@@ -28,7 +28,7 @@ clip_ratio_high=0.28
 GPUS=(0 1 2 3 4 5 6 7)
 my_world_size=${#GPUS[@]}
 
-math_train_path=/mnt/nushare2/data/baliao/dynamic_filter/data/openr1/train_hard.parquet
+math_train_path=/mnt/nushare2/data/baliao/dynamic_filter/data/openr1/train.parquet
 math_test_path=/mnt/nushare2/data/baliao/dynamic_filter/data/test/test.parquet 
 train_files="['$math_train_path']"
 test_files="['$math_test_path']"
