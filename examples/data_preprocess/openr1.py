@@ -23,15 +23,19 @@ if __name__ == '__main__':
     parser.add_argument('--train_start', type=int, default=0)
     parser.add_argument('--train_end', type=int, default=10000000)
     parser.add_argument('--model_name_or_path', type=str, default='Qwen/Qwen2.5-Math-1.5B')
+    parser.add_argument('--data_source', type=str, default='weqweasdas/from_default_filtered_openr1_with_scores_filtered_0125_but_not_all_wrong')
 
     args = parser.parse_args()
+    
+    if ".json" not in args.data_source:
+        print(f"Loading the {args.data_source} dataset from huggingface...", flush=True)
+        dataset = datasets.load_dataset(args.data_source, trust_remote_code=True)
+        train_dataset = dataset['train']
+    else:
+        print(f"Loading the {args.data_source} dataset from local json file...", flush=True)
+        train_dataset = datasets.load_dataset('json', data_files=args.data_source, split="train")
 
-    data_source = 'weqweasdas/from_default_filtered_openr1_with_scores_filtered_0125_but_not_all_wrong' #'weqweasdas/filtered_openr1'
-    print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    dataset = datasets.load_dataset(data_source, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-
-    train_dataset = dataset['train']
     args.train_end = min(args.train_end, len(train_dataset))
     if args.train_end > 0:
         train_dataset = train_dataset.select(range(args.train_start, args.train_end))
