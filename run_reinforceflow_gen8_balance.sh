@@ -59,6 +59,7 @@ export WANDB_MODE="offline"
 export WANDB_DIR=${CKPTS_DIR}/logs
 
 mkdir -p ${CKPTS_DIR}/logs
+chown -R 110541254:110541254 ${CKPTS_DIR}
 
 # 算法和性能相关参数
 
@@ -150,3 +151,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps=2000 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.log_val_generations=10 2>&1 | tee ${CKPTS_DIR}/logs/log
+
+chown -R 110541254:110541254 ${CKPTS_DIR}

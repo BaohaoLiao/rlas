@@ -10,6 +10,8 @@ export NCCL_P2P_DISABLE=1
 save_dir="/mnt/nushare2/data/baliao/dynamic_filter/00_start"
 mkdir -p ${save_dir}/${project_name}/${experiment_name}/logs
 
+chown -R 110541254:110541254 ${save_dir}
+
 #export CUDA_VISIBLE_DEVICES="1,7,8,9" # GPU的ID，数量应与 NGPUS 匹配
 project_name='Reinforceflow'
 experiment_name='GRPO-Llama-3.2-3B-Instruct-n4' # 更新了实验名称以作区分
@@ -84,3 +86,5 @@ CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPUS[*]}") python3 -m verl.trainer.main_pp
     trainer.default_local_dir=${save_dir}/${project_name}/${experiment_name} \
     trainer.test_freq=50 \
     trainer.total_epochs=1000 2>&1 | tee ${save_dir}/${project_name}/${experiment_name}/logs/log
+
+chown -R 110541254:110541254 ${save_dir}
