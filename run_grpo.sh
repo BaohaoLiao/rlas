@@ -1,14 +1,13 @@
 #!/bin/bash
 
 cd /data/chatgpt-training-slc-a100/data/baliao/dynamic_filter/00_start/rlas
-nvidia-smi
 
 # For debug
 export HYDRA_FULL_ERROR=1
 export NCCL_P2P_LEVEL=NVL
 export NCCL_P2P_DISABLE=1
 
-save_dir="/mnt/nushare2/data/baliao/dynamic_filter/00_start/grpo_4gpu"
+save_dir="/mnt/nushare2/data/baliao/dynamic_filter/00_start"
 mkdir -p ${save_dir}/logs/${project_name}
 
 #export CUDA_VISIBLE_DEVICES="1,7,8,9" # GPU的ID，数量应与 NGPUS 匹配
@@ -21,11 +20,9 @@ experiment_name='GRPO-Llama-3.2-3B-Instruct-n4' # 更新了实验名称以作区
 set -x
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
-data=numina_math
 
 algorithm=grpo
-#model=qwen/Qwen2.5-Math-1.5B
-meta-llama/Llama-3.2-3B-Instruct
+model=meta-llama/Llama-3.2-3B-Instruct
 model_name_or_path=/mnt/nushare2/data/baliao/PLLMs/$model
 n=4
 kl_coef=0.0
