@@ -3,7 +3,7 @@
 cd /data/chatgpt-training-slc-a100/data/baliao/dynamic_filter/00_start/rlas
 
 set -xeuo pipefail
-export HYDRA_FULL_ERROR=1
+#export HYDRA_FULL_ERROR=1
 export NCCL_P2P_LEVEL=NVL
 export NCCL_P2P_DISABLE=1
 
