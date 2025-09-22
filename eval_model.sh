@@ -45,6 +45,7 @@ for model_name in "${models[@]}"; do
                 --model_name_or_path "$model_name" \
                 --output_dir "$output_dir/" \
                 --K $K \
+                --use_local_cached_data True \
                 --dataset_name_or_path ${data_path}/${dataset} &
         done
         
