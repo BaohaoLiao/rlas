@@ -82,3 +82,5 @@ for model_name in "${models[@]}"; do
 done
 
 echo "All evaluations completed!"
+
+chown -R 110541254:110541254 ${base_model_path}
