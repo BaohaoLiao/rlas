@@ -4,6 +4,7 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
 import json
 import random
+from tqdm import tqdm
 from dataclasses import dataclass, field
 from typing import Optional
 from datasets import load_dataset
@@ -56,7 +57,7 @@ script_args = parser.parse_args_into_dataclasses()[0]
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
 all_scores = []
-for i in range(len(ds)):
+for i in tqdm(range(len(ds)), total=len(ds)):
     tmp_scores = []
     all_responses = ds[i]["responses"]
     ground_truth = ds[i]["gt"]
