@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cd /data/chatgpt-training-slc-a100/data/baliao/dynamic_filter/00_start/rlas
+
 models=()
 base_model_path="/mnt/nushare2/data/baliao/dynamic_filter/00_start/Reinforceflow/GRPO-Llama-3.2-3B-Instruct-n4"
 
