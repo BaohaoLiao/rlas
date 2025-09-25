@@ -55,7 +55,7 @@ if __name__ == '__main__':
             
             reward_model = {
                 "style": "rule",
-                "ground_truth": example['answer']
+                "ground_truth": example['gt']
             }
 
             data = {
