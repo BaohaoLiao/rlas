@@ -15,14 +15,14 @@
 # limitations under the License.
 """
 PPO Trainer with Ray-based single controller.
-gen 8
+ray_trainer_gen8_balance_ppl, 正样本选perplexity最大的负样本选random
 """
 
 import json
 import os
 import random
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -363,6 +363,21 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        # Initialize PPL tracking for adaptive sample selection
+        self.N_long = getattr(config.trainer, 'ppl_long_window', 50)  # 长期均线窗口
+        self.N_short = getattr(config.trainer, 'ppl_short_window', 10)  # 短期均线窗口
+        self.ppl_tolerance = getattr(config.trainer, 'ppl_tolerance', 0.06)  # 容忍度
+        self.ppl_warmup_steps = getattr(config.trainer, 'ppl_warmup_steps', 50)  # warmup步数，默认为N_long
+        if self.ppl_warmup_steps is None:
+            self.ppl_warmup_steps = self.N_long
+        
+        # PPL移动平均线计算
+        self.alpha_long = 2 / (self.N_long + 1)
+        self.alpha_short = 2 / (self.N_short + 1)
+        self.ema_long = 0.0
+        self.ema_short = 0.0
+        self.ppl_initialized = False
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1425,9 +1440,12 @@ class RayPPOTrainer:
         import torch
         from collections import defaultdict
         import math
+        from datasets import Dataset
 
         assert actual_repeat % round_repeat == 0, "actual_repeat 必须能被 round_repeat 整除"
         max_rounds = actual_repeat // round_repeat
+        target_pos = final_keep_per_prompt // 2
+        target_neg = final_keep_per_prompt - target_pos
 
         def _first_dim_size(dp: DataProto) -> int:
             if hasattr(dp, "batch") and isinstance(dp.batch, dict) and dp.batch:
@@ -1446,28 +1464,40 @@ class RayPPOTrainer:
             return _first_dim_size(dp)
 
         def _dp_cat(frags: list[DataProto]) -> DataProto:
+            """使用 DataProto.concat() 保持高效的 TensorDict 结构"""
             assert len(frags) > 0, "空片段列表"
+            
+            # 检查键一致性（保持原有的警告机制）
             tensor_keys_sets = [set(f.batch.keys()) for f in frags]
             nontensor_keys_sets = [set(f.non_tensor_batch.keys()) for f in frags]
             tensor_keys = set.intersection(*tensor_keys_sets) if tensor_keys_sets else set()
             nontensor_keys = set.intersection(*nontensor_keys_sets) if nontensor_keys_sets else set()
+            
             if any(set(f.batch.keys()) != tensor_keys for f in frags):
                 missing = set.union(*tensor_keys_sets) - tensor_keys
                 print(f"[warn] tensor keys 不一致，使用交集：忽略 {missing}")
             if any(set(f.non_tensor_batch.keys()) != nontensor_keys for f in frags):
                 missing = set.union(*nontensor_keys_sets) - nontensor_keys
                 print(f"[warn] non-tensor keys 不一致，使用交集：忽略 {missing}")
-            out_batch = {k: torch.cat([f.batch[k] for f in frags], dim=0) for k in tensor_keys}
-            out_non_tensor = {}
-            for k in nontensor_keys:
-                parts = [np.array(f.non_tensor_batch[k], dtype=object) for f in frags]
-                out_non_tensor[k] = np.concatenate(parts, axis=0)
-            merged = DataProto.from_single_dict({**out_batch, **out_non_tensor})
+            
+            # 使用 DataProto.concat() 保持 TensorDict 优化
             try:
-                merged.meta_info = dict(getattr(frags[0], "meta_info", {}) or {})
-            except Exception:
-                pass
-            return merged
+                merged = DataProto.concat(frags)
+                return merged
+            except Exception as e:
+                # 如果 concat 失败，回退到原来的方法
+                print(f"[warn] DataProto.concat() 失败，回退到手动拼接: {e}")
+                out_batch = {k: torch.cat([f.batch[k] for f in frags], dim=0) for k in tensor_keys}
+                out_non_tensor = {}
+                for k in nontensor_keys:
+                    parts = [np.array(f.non_tensor_batch[k], dtype=object) for f in frags]
+                    out_non_tensor[k] = np.concatenate(parts, axis=0)
+                merged = DataProto.from_single_dict({**out_batch, **out_non_tensor})
+                try:
+                    merged.meta_info = dict(getattr(frags[0], "meta_info", {}) or {})
+                except Exception:
+                    pass
+                return merged
 
         ctx_uid_to_fields: dict = {}
         if context_batch is not None:
@@ -1488,13 +1518,10 @@ class RayPPOTrainer:
 
         uid_arr = list(orig_prompt_batch.non_tensor_batch["uid"])
 
-        state = {uid: {"finished": False, "seen": 0, "pos": 0} for uid in uid_arr}
-        first4_cache: dict[str, DataProto] = {}   # uid -> 第0轮的前round_repeat条片段
-        pos_cache = defaultdict(list)
-        neg_cache = defaultdict(list)
-        all_samples_cache = defaultdict(list)
+        state = {uid: {"finished": False, "seen": 0, "pos": 0, 'neg': 0} for uid in uid_arr}
+        #first8_cache: dict[str, DataProto] = {}   # uid -> 第0轮的前round_repeat条片段
+        all_candidates_cache = []
         selected_pool_batches: list[DataProto] = []
-        selected_count_by_uid = defaultdict(int)
         rounds_info = {"per_round": []}
 
         def compute_seq_rewards_for_round(mini_prompt_batch: DataProto, gen_out: DataProto):
@@ -1565,7 +1592,7 @@ class RayPPOTrainer:
         for r in range(max_rounds):
             t0 = time.time()
             if not active_uids:
-                rounds_info["per_round"].append({"round": r, "active_prompts": 0, "made_positive": 0, "finished_prompts": sum(1 for s in state.values() if s["finished"]), "sec": 0.0})
+                rounds_info["per_round"].append({"round": r, "active_prompts": 0, "completed": 0, "finished_prompts": sum(1 for s in state.values() if s["finished"]), "sec": 0.0})
                 break
 
             uid_to_idx = {uid: i for i, uid in enumerate(uid_arr)}
@@ -1597,21 +1624,17 @@ class RayPPOTrainer:
             for j, uid in enumerate(uids_round):
                 per_uid_local_idx[uid].append(j)
 
-            for uid in per_uid_local_idx:
-                if uid in active_uids:
-                    all_samples_cache[uid].append(mini_with_out[per_uid_local_idx[uid]])
-
-            made_positive_this_round = 0
+            completed_this_round = 0
             for uid in list(active_uids):
                 locs = per_uid_local_idx.get(uid, [])
                 if not locs: continue
                 st = state[uid]
 
                 # r==0：缓存前round_repeat个片段
-                if r == 0:
-                    first4 = locs[:round_repeat]
-                    if first4 and uid not in first4_cache:
-                        first4_cache[uid] = mini_with_out[first4]
+                # if r == 0:
+                #     first8 = locs[:round_repeat]
+                #     if first8 and uid not in first8_cache:
+                #         first8_cache[uid] = mini_with_out[first8]
 
                 for j in locs:
                     if st["finished"]: break
@@ -1619,52 +1642,129 @@ class RayPPOTrainer:
                     is_positive = seq_reward_np[j] > positive_threshold
                     if is_positive:
                         st["pos"] += 1
-                        pos_cache[uid].append(mini_with_out[[j]])
-                        made_positive_this_round += 1
                     else:
-                        neg_cache[uid].append(mini_with_out[[j]])
+                        st["neg"] += 1
+                    all_candidates_cache.append(mini_with_out[[j]])
 
                 if not st["finished"]:
-                    ratio = (st["pos"] / st["seen"]) if st["seen"] > 0 else 0.0
-                    target_pos = math.ceil(ratio * final_keep_per_prompt)
                     
-                    target_pos = max(min(target_pos, final_keep_per_prompt - 1),1)
-
-                    neg_need = final_keep_per_prompt - target_pos
-                    
-                    if len(pos_cache[uid]) >= target_pos and len(neg_cache[uid]) >= neg_need and uid in first4_cache:
-                        pos_frags = pos_cache[uid][:target_pos]
-                        neg_frags = neg_cache[uid][:neg_need]
-                        frags_to_cat = pos_frags + neg_frags
-
-                        if len(frags_to_cat) == final_keep_per_prompt:
-                            merged = _dp_cat(frags_to_cat)
-                            selected_pool_batches.append(merged)
-                            selected_count_by_uid[uid] = _dp_rows(merged)
-                            st["finished"] = True
+                    if st["pos"] >= target_pos and st["neg"] >= target_neg:
+                        st["finished"] = True
+                        completed_this_round += 1
 
             active_uids = {u for u in active_uids if not state[u]["finished"]}
             sec = time.time() - t0
             if timing_raw is not None: timing_raw[f"gen_round_{r}_sec"] = sec
-            rounds_info["per_round"].append({"round": r, "active_prompts": len(per_uid_local_idx), "made_positive": made_positive_this_round, "finished_prompts": sum(1 for s in state.values() if s["finished"]), "reward_mean": float(np.mean(seq_reward_np)) if seq_reward_np else 0.0, "sec": round(sec, 3)})
-            print(f"[Gen-Round {r}] active_prompts={len(per_uid_local_idx)} made_positive={made_positive_this_round} finished={rounds_info['per_round'][-1]['finished_prompts']} time={sec:.3f}s reward_mean={rounds_info['per_round'][-1]['reward_mean']:.4f}")
+            rounds_info["per_round"].append({"round": r, "active_prompts": len(per_uid_local_idx), "completed": completed_this_round, "finished_prompts": sum(1 for s in state.values() if s["finished"]), "reward_mean": float(np.mean(seq_reward_np)) if seq_reward_np else 0.0, "sec": round(sec, 3)})
+            print(f"[Gen-Round {r}] active_prompts={len(per_uid_local_idx)} completed={completed_this_round} finished={rounds_info['per_round'][-1]['finished_prompts']} time={sec:.3f}s reward_mean={rounds_info['per_round'][-1]['reward_mean']:.4f}")
             if not active_uids: break
 
-        uids_that_need_fallback = {uid for uid in uid_arr if selected_count_by_uid.get(uid, 0) == 0}
-        for uid in uids_that_need_fallback:
-            if uid in first4_cache and first4_cache[uid] is not None:
-                n_rows = _dp_rows(first4_cache[uid])
-                take = min(final_keep_per_prompt, n_rows)
-                frag = first4_cache[uid][:take] if take < n_rows else first4_cache[uid]
-                selected_pool_batches.append(frag)
-                selected_count_by_uid[uid] = take
+        all_candidates_cache = _dp_cat(all_candidates_cache)
+        # 确保有response_mask字段
+        if "response_mask" not in all_candidates_cache.batch:
+            all_candidates_cache.batch["response_mask"] = compute_response_mask(all_candidates_cache)
+        # 计算所有all_candidates_cache的old_log_prob
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(all_candidates_cache)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = all_candidates_cache.batch["response_mask"]
+            # loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+            # entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+            old_log_probs = old_log_prob.batch["old_log_probs"]
+            masked_log_probs = old_log_probs * response_masks
+            sample_nlls = -torch.sum(masked_log_probs, dim=1)  # (batch_size,)
+            sample_valid_tokens = torch.sum(response_masks, dim=1)  # (batch_size,)
+            sample_perplexity = sample_nlls / sample_valid_tokens  # (batch_size,)
+            # Handle division by zero
+            sample_perplexity = torch.where(sample_valid_tokens > 0, sample_perplexity, torch.zeros_like(sample_perplexity))
+            old_log_prob.batch.pop("entropys")
+            all_candidates_cache = all_candidates_cache.union(old_log_prob)
+            all_candidates_cache.batch["entropy"] = entropys
+            all_candidates_cache.batch["perplexity"] = sample_perplexity
+
+        # 计算当前步骤的平均PPL并更新自适应策略
+        current_step_ppl = all_candidates_cache.batch["perplexity"].mean().item()
+        selection_mode = self._update_ppl_tracking(current_step_ppl)
+        
+        # 详细的模式选择日志
+        print(f"\n🎯 [Step {self.global_steps}] PPL自适应策略分析")
+        print(f"   当前步骤PPL: {current_step_ppl:.4f}")
+        print(f"   EMA短期: {self.ema_short:.4f}")
+        print(f"   EMA长期: {self.ema_long:.4f}")
+        
+        if self.ppl_initialized and self.global_steps >= self.ppl_warmup_steps:
+            consolidation_threshold = self.ema_long * (1 + self.ppl_tolerance)
+            exploration_threshold = self.ema_long * (1 - self.ppl_tolerance)
+            print(f"   阈值范围: [{exploration_threshold:.4f}, {consolidation_threshold:.4f}]")
+            print(f"   容忍度: ±{self.ppl_tolerance*100:.1f}%")
+            
+            # 详细的模式判断原因
+            if self.ema_short > consolidation_threshold:
+                diff_pct = (self.ema_short - self.ema_long) / self.ema_long * 100
+                print(f"   🔴 模式: {selection_mode} - 短期PPL比长期高{diff_pct:.1f}%，模型可能不稳定，选择低PPL样本")
+            elif self.ema_short < exploration_threshold:
+                diff_pct = (self.ema_long - self.ema_short) / self.ema_long * 100
+                print(f"   🟡 模式: {selection_mode} - 短期PPL比长期低{diff_pct:.1f}%，PPL下降过快，选择高PPL样本保持多样性")
             else:
-                print(f"[warn] uid={uid} 没有 first4_cache，无法兜底。")
+                ratio = self.ema_short / self.ema_long
+                print(f"   🟢 模式: {selection_mode} - 短期/长期比率{ratio:.3f}，趋势健康，平衡选择高低PPL样本")
+        else:
+            warmup_remaining = self.ppl_warmup_steps - self.global_steps
+            print(f"   🔵 模式: {selection_mode} (warmup阶段，剩余{warmup_remaining}步)")
+            print(f"   说明: warmup期间使用均衡模式，让EMA有足够数据建立基线")
 
-        if not selected_pool_batches:
-            raise RuntimeError("早停后没有选中任何样本，请检查阈值/规则是否过严或数据是否异常")
+        # 按照uid分组
+        uid_to_traj_indices = defaultdict(list)
+        final_kept_indices = []
+        for i, uid in enumerate(all_candidates_cache.non_tensor_batch["uid"]):
+            uid_to_traj_indices[uid].append(i)
 
-        selected_batch = _dp_cat(selected_pool_batches)
+        for uid in uid_arr:
+            indices = uid_to_traj_indices.get(uid, [])
+            if not indices: continue
+            pos_indices_perplexity = [(i, all_candidates_cache.batch["perplexity"][i]) for i in indices if (all_candidates_cache.batch["token_level_rewards"][i]).sum(dim=-1) > positive_threshold]
+            neg_indices_perplexity = [(i, all_candidates_cache.batch["perplexity"][i]) for i in indices if (all_candidates_cache.batch["token_level_rewards"][i]).sum(dim=-1) <= positive_threshold]
+            pos_num = len(pos_indices_perplexity)
+            neg_num = len(neg_indices_perplexity)
+            n_rows = pos_num + neg_num
+            take = min(final_keep_per_prompt, n_rows)
+            if n_rows < final_keep_per_prompt:
+                print(f"[WARN] uid={uid} 样本{n_rows}不足目标{final_keep_per_prompt}，但继续处理")
+            
+            actual_pos = min(pos_num, target_pos)
+            actual_neg = min(neg_num, target_neg)
+            # 如果一种样本不足，用另一种补齐
+            if actual_pos + actual_neg < take:
+                if pos_num > actual_pos:
+                    # 用正样本补齐
+                    additional_pos = min(pos_num - actual_pos, take - actual_pos - actual_neg)
+                    actual_pos += additional_pos
+                elif neg_num > actual_neg:
+                    # 用负样本补齐
+                    additional_neg = min(neg_num - actual_neg, take - actual_pos - actual_neg)
+                    actual_neg += additional_neg
+
+            # 使用自适应样本选择策略
+            selected_pos_indices, selected_neg_indices = self._select_samples_by_mode(
+                pos_indices_perplexity, neg_indices_perplexity, 
+                actual_pos, actual_neg, selection_mode
+            )
+            
+            # 合并选中的样本索引
+            selected_indices = selected_pos_indices + selected_neg_indices
+            final_kept_indices.extend(selected_indices)
+
+        # 使用下采样后的索引重新构建batch
+        if final_kept_indices and len(final_kept_indices) > 0:
+            # 确保final_kept_indices是列表格式
+            if not isinstance(final_kept_indices, list):
+                final_kept_indices = list(final_kept_indices)
+            selected_batch = all_candidates_cache[final_kept_indices]
+        else:
+            # 如果没有选中任何样本，使用所有样本
+            print(f"[WARN] No samples selected, using all {len(all_candidates_cache)} samples")
+            selected_batch = all_candidates_cache
+
         
         def _align_ctx_rows_to_selected(selected: DataProto, ctx: DataProto) -> DataProto:
             import numpy as np
@@ -1714,9 +1814,114 @@ class RayPPOTrainer:
         final_batch = selected_batch
         if "token_level_scores" not in final_batch.batch and "token_level_rewards" in final_batch.batch:
             final_batch.batch["token_level_scores"] = final_batch.batch["token_level_rewards"]
+        
+        # 验证 final_batch 保持了高效的 TensorDict 结构
+        if hasattr(final_batch.batch, '__class__'):
+            batch_type = final_batch.batch.__class__.__name__
+            if 'TensorDict' not in batch_type and 'dict' in batch_type.lower():
+                print(f"[perf_warn] final_batch.batch 是普通 {batch_type}，可能影响性能")
+            else:
+                print(f"[perf_info] final_batch.batch 是高效的 {batch_type}")
 
-        return final_batch, rounds_info
+        return final_batch, rounds_info, current_step_ppl, selection_mode
 
+    def _update_ppl_tracking(self, current_ppl: float) -> str:
+        """
+        更新PPL移动平均线并返回当前的样本选择模式
+        
+        Args:
+            current_ppl: 当前步骤的平均PPL
+            
+        Returns:
+            selection_mode: "Consolidation", "Exploration", 或 "Balanced"
+        """
+        # 初始化EMA值
+        if not self.ppl_initialized:
+            self.ema_long = current_ppl
+            self.ema_short = current_ppl
+            self.ppl_initialized = True
+        else:
+            # 使用EMA公式进行迭代更新
+            self.ema_long = self.alpha_long * current_ppl + (1 - self.alpha_long) * self.ema_long
+            self.ema_short = self.alpha_short * current_ppl + (1 - self.alpha_short) * self.ema_short
+        
+        # warmup阶段处理
+        if self.global_steps < self.ppl_warmup_steps:
+            return "Balanced"
+        
+        # 自适应模式判断
+        consolidation_threshold = self.ema_long * (1 + self.ppl_tolerance)
+        exploration_threshold = self.ema_long * (1 - self.ppl_tolerance)
+        
+        if self.ema_short > consolidation_threshold:
+            # 短期PPL显著高于长期趋势 -> 模型不稳定，需要巩固
+            return "Consolidation"
+        elif self.ema_short < exploration_threshold:
+            # 短期PPL显著低于长期趋势 -> PPL下降过快，可能丧失多样性，需要探索
+            return "Exploration"
+        else:
+            # 短期和长期趋势一致 -> 模型状态健康
+            return "Balanced"
+
+    def _select_samples_by_mode(self, pos_indices_perplexity: list, neg_indices_perplexity: list, 
+                               target_pos: int, target_neg: int, selection_mode: str) -> tuple:
+        """
+        根据选择模式选择正样本和负样本
+        
+        Args:
+            pos_indices_perplexity: [(index, perplexity), ...] 正样本索引和perplexity对
+            neg_indices_perplexity: [(index, perplexity), ...] 负样本索引和perplexity对  
+            target_pos: 目标正样本数量
+            target_neg: 目标负样本数量
+            selection_mode: 选择模式
+            
+        Returns:
+            (selected_pos_indices, selected_neg_indices): 选中的正样本和负样本索引
+        """
+        actual_pos = min(len(pos_indices_perplexity), target_pos)
+        actual_neg = min(len(neg_indices_perplexity), target_neg)
+        
+        # 选择正样本
+        if actual_pos == 0:
+            selected_pos_indices = []
+        elif selection_mode == "Consolidation":
+            # 巩固模式：选择PPL最低的正样本
+            pos_sorted = sorted(pos_indices_perplexity, key=lambda x: x[1])  # 升序排序
+            selected_pos_indices = [x[0] for x in pos_sorted[:actual_pos]]
+            
+        elif selection_mode == "Exploration":
+            # 探索模式：选择PPL最高的正样本  
+            pos_sorted = sorted(pos_indices_perplexity, key=lambda x: x[1], reverse=True)  # 降序排序
+            selected_pos_indices = [x[0] for x in pos_sorted[:actual_pos]]
+            
+        else:  # Balanced Mode
+            # 均衡模式：选择1个最高PPL和1个最低PPL的正样本（如果有足够样本的话）
+            if actual_pos >= 2:
+                pos_sorted_asc = sorted(pos_indices_perplexity, key=lambda x: x[1])  # 升序
+                pos_sorted_desc = sorted(pos_indices_perplexity, key=lambda x: x[1], reverse=True)  # 降序
+                
+                selected_pos_indices = []
+                # 先选最低PPL的
+                low_count = actual_pos // 2
+                selected_pos_indices.extend([x[0] for x in pos_sorted_asc[:low_count]])
+                # 再选最高PPL的
+                high_count = actual_pos - low_count
+                selected_pos_indices.extend([x[0] for x in pos_sorted_desc[:high_count]])
+            else:
+                # 样本不足时随机选择
+                if actual_pos > 0:
+                    selected_pos_indices = [x[0] for x in random.sample(pos_indices_perplexity, actual_pos)]
+                else:
+                    selected_pos_indices = []
+        
+        # 负样本始终随机选择（保持原有逻辑）
+        neg_indices_only = [x[0] for x in neg_indices_perplexity]
+        if len(neg_indices_only) >= actual_neg:
+            selected_neg_indices = random.sample(neg_indices_only, actual_neg)
+        else:
+            selected_neg_indices = neg_indices_only
+            
+        return selected_pos_indices, selected_neg_indices
 
     def fit(self):
         """
@@ -1743,7 +1948,8 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if False:
+        #if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -1805,8 +2011,8 @@ class RayPPOTrainer:
                     final_keep_per_prompt = 4  # 每个 prompt 最终保留4条
 
                     with marked_timer("gen_multi_round", timing_raw, color="red"):
-                        # 函数已返回对齐合并后的“最终 batch”
-                        final_batch, rounds_info = self._generate_multi_round_with_early_downsampling(
+                        # 函数已返回对齐合并后的"最终 batch"
+                        final_batch, rounds_info, current_step_ppl, selection_mode = self._generate_multi_round_with_early_downsampling(
                             orig_prompt_batch=gen_batch,
                             positive_threshold=positive_threshold,
                             actual_repeat=actual_repeat,
@@ -1827,7 +2033,7 @@ class RayPPOTrainer:
                             finished_prompts = 0
                         for info in rounds_info["per_round"]:
                             print(f"  - round {info['round']}: active={info['active_prompts']}, "
-                                f"made_pos={info['made_positive']}, finished={info['finished_prompts']}, "
+                                f"made_pos={info['completed']}, finished={info['finished_prompts']}, "
                                 f"time={info['sec']}s")
                     # write into metrics
                     metrics["sampling/total_samples"] = np.sum([(info["active_prompts"] * round_repeat) for info in rounds_info["per_round"]])
@@ -1841,9 +2047,31 @@ class RayPPOTrainer:
                     
                     metrics["sampling/prompts_no_positive_anywhere"] = rounds_info["per_round"][0]["active_prompts"] - rounds_info["per_round"][-1]["finished_prompts"]
                     metrics['sampling/kept_samples'] = len(final_batch)
-
+                    
+                    # 添加PPL相关的metrics
+                    metrics["ppl/current_step"] = current_step_ppl
+                    metrics["ppl/ema_short"] = self.ema_short
+                    metrics["ppl/ema_long"] = self.ema_long
+                    metrics["ppl/selection_mode"] = {"Consolidation": 0, "Exploration": 1, "Balanced": 2}[selection_mode]
+                    if self.ppl_initialized:
+                        metrics["ppl/short_vs_long_ratio"] = self.ema_short / self.ema_long if self.ema_long > 0 else 1.0
+                    
                     # ✅ 关键：不要再 repeat / union 了，直接用最终 batch
                     batch = final_batch
+                    
+                    # 最终训练样本统计 (使用final_batch中的token_level_rewards)
+                    if "token_level_rewards" in batch.batch:
+                        final_pos_count = sum(1 for i in range(len(batch)) if batch.batch["token_level_rewards"][i].sum() > positive_threshold)
+                        final_neg_count = len(batch) - final_pos_count
+                        print(f"\n📈 [Step {self.global_steps}] 最终训练样本统计:")
+                        print(f"   最终样本分布: {final_pos_count}正 + {final_neg_count}负 = {len(batch)}总")
+                    else:
+                        print(f"\n📈 [Step {self.global_steps}] 最终训练样本统计:")
+                        print(f"   最终样本数量: {len(batch)}总 (无奖励信息)")
+                    print(f"   PPL自适应策略: {selection_mode}模式")
+                    if self.ppl_initialized:
+                        print(f"   EMA趋势: 短期({self.ema_short:.4f}) vs 长期({self.ema_long:.4f})")
+                    print("=" * 80)
 
                     # 之后保持不变（mask/balance/kl/adv/损失等）...
                     if "response_mask" not in batch.batch:
@@ -1864,6 +2092,12 @@ class RayPPOTrainer:
                             padding_batch = batch[indices_to_repeat]
                             batch = DataProto.concat([batch, padding_batch])
                             
+                            # 验证padding后batch结构保持高效
+                            if hasattr(batch.batch, '__class__'):
+                                batch_type = batch.batch.__class__.__name__
+                                if 'TensorDict' not in batch_type and 'dict' in batch_type.lower():
+                                    print(f"[perf_warn] 填充后batch.batch是普通{batch_type}，可能影响性能")
+                            
                             # Now balance the padded batch
                             self._balance_batch(batch, metrics=metrics)
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1875,17 +2109,18 @@ class RayPPOTrainer:
                     metrics["sampling/downsampled_samples"] = len(batch)           # 实际用于训练的样本数
                     metrics["sampling/total_prompts"] = total_prompts
 
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
+                    # log old_log_probs
+                    if 'old_log_probs' in batch.batch.keys():
+                        old_log_prob = batch.batch["old_log_probs"]
+                        entropys = batch.batch['entropy']
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        old_log_prob_metrics = {
+                            "actor/entropy": entropy_agg.detach().item(),
+                            "actor/perplexity": batch.batch["perplexity"].mean().detach().item()
+                        }
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
