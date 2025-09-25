@@ -129,10 +129,15 @@ def main():
     ds = ds.map(make_prompt)
 
     data_size = len(ds["prompt"])
-    one_num_share = int(data_size / script_args.my_world_size)
-    ds = ds.select(np.arange(script_args.local_index * one_num_share, (script_args.local_index + 1) * one_num_share))
+    # base size and remainder
+    k, m = divmod(data_size, script_args.my_world_size)
+    # compute start and end index for this rank
+    start = script_args.local_index * k + min(script_args.local_index, m)
+    end = (script_args.local_index + 1) * k + min(script_args.local_index + 1, m)
+    # slice dataset
+    ds = ds.select(np.arange(start, end))
 
-    print([script_args.local_index * one_num_share, (script_args.local_index + 1) * one_num_share])
+    print([start, end])
     print(ds, script_args.dataset_name_or_path)
     print(ds[0])
 
