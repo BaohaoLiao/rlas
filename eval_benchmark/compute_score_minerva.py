@@ -64,7 +64,10 @@ for i in tqdm(range(len(ds))):
     ground_truth = ds[i]["gt"]
     for response in all_responses:
         pred = extract_answer(response, "minerva_math")
-        score = math_equal(pred, ground_truth, timeout=True)
+        try:
+            score = math_equal(pred, ground_truth, timeout=True)
+        except TimeoutException:
+            score = 0
         tmp_scores.append(score)
     all_scores.append(tmp_scores)
 
