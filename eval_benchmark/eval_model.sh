@@ -66,9 +66,15 @@ for model_name in "${models[@]}"; do
         
         # Compute scores
         echo "Computing scores..."
-        python3 compute_score.py \
-            --dataset_path "$output_dir/merged_data.jsonl" \
-            --record_path "$output_dir/record.txt"
+        if [[ "$dataset" == *"minerva_math"* ]]; then
+            python3 eval_benchmark/compute_score_minerva.py \
+                --dataset_path "$output_dir/merged_data.jsonl" \
+                --record_path "$output_dir/record.txt"
+        else
+            python3 eval_benchmark/compute_score.py \
+                --dataset_path "$output_dir/merged_data.jsonl" \
+                --record_path "$output_dir/record.txt"
+        fi
         
         if [ $? -ne 0 ]; then
             echo "Error: Failed to compute scores for $model_name on $dataset"
