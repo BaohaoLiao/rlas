@@ -9,7 +9,10 @@ from datasets import load_dataset
 from transformers import HfArgumentParser
 import numpy as np
 
-from qwen_evaluation.grader import math_equal
+from pebble import ProcessPool
+from concurrent.futures import TimeoutError
+
+from qwen_evaluation.grader import math_equal_process
 from qwen_evaluation.parser import extract_answer
 
 
@@ -57,19 +60,49 @@ script_args = parser.parse_args_into_dataclasses()[0]
 
 ds = load_dataset("json", data_files=script_args.dataset_path, split="train")
 
+
+params = [
+    (
+        idx, extract_answer(response, "minerva_math"), sample['gt']
+    ) for idx, sample in enumerate(ds) for response in sample['responses']
+]
+
 all_scores = []
-for i in tqdm(range(len(ds))):
-    tmp_scores = []
-    all_responses = ds[i]["responses"]
-    ground_truth = ds[i]["gt"]
-    for response in all_responses:
-        pred = extract_answer(response, "minerva_math")
-        try:
-            score = math_equal(pred, ground_truth, timeout=True)
-        except TimeoutException:
-            score = 0
-        tmp_scores.append(score)
-    all_scores.append(tmp_scores)
+timeout_cnt = 0 
+
+with ProcessPool(max_workers=1) as pool:
+    future = pool.map(math_equal_process, params, timeout=3)
+    iterator = future.result()
+    with tqdm(total=len(ds), desc="Evaluate") as progress_bar:
+        while True:
+            try:
+                result = next(iterator)
+                all_scores.append(result)
+            except StopIteration:
+                break
+            except TimeoutError as error:
+                print(error)
+                all_scores.append(False)
+                timeout_cnt += 1
+            except Exception as error:
+                print(error.traceback)
+                exit()
+            progress_bar.update(1) 
+
+
+# all_scores = []
+# for i in tqdm(range(len(ds))):
+#     tmp_scores = []
+#     all_responses = ds[i]["responses"]
+#     ground_truth = ds[i]["gt"]
+#     for response in all_responses:
+#         pred = extract_answer(response, "minerva_math")
+#         try:
+#             score = math_equal(pred, ground_truth, timeout=True)
+#         except TimeoutException:
+#             score = 0
+#         tmp_scores.append(score)
+#     all_scores.append(tmp_scores)
 
 with open(script_args.record_path, "w") as f:
     rounded_scores = np.round(np.mean(all_scores), 4)
