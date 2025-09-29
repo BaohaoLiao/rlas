@@ -1,6 +1,3 @@
-import json
-
-
 def get_examples():
     examples = {}
     examples["gsm8k"] = [

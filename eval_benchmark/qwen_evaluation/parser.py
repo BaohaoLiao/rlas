@@ -3,7 +3,7 @@ import re
 from latex2sympy2_extended.latex2sympy2 import latex2sympy
 from typing import Any, Dict
 from word2number import w2n
-from utils import *
+from .utils import *
 
 
 def _fix_fracs(string):
