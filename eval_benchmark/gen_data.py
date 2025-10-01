@@ -91,6 +91,7 @@ def main():
         max_model_len=script_args.max_input_length,
         load_format="auto",
         seed=42,
+        trust_remote_code=True, 
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
